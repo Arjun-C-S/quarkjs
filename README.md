@@ -110,7 +110,7 @@ QuarkJS is three stacked systems:
 └─────────────────────────────────────┘
 ```
 
-The event loop is a **scheduler** owned by the Runtime Manager — not a pipeline stage scripts flow through. This distinction matters for correct deadlock analysis and lifecycle design.
+The event loop is a **scheduler** owned by the Runtime Manager — not a pipeline stage scripts flow through. The dependency stack reads bottom-up: Engine → Bindings → Runtime APIs. `console.log` is a Runtime API implemented using the binding layer, not a standalone component. These distinctions matter for correct initialization order and deadlock analysis.
 
 For the full technical breakdown see [ARCHITECTURE.md](ARCHITECTURE.md).
 For the build plan see [ROADMAP.md](ROADMAP.md).
