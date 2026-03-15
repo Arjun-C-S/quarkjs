@@ -12,14 +12,15 @@ This document is the full technical specification for QuarkJS. It covers system 
 4. [QuickJS Core Model](#4-quickjs-core-model)
 5. [Context vs Runtime vs Isolate](#5-context-vs-runtime-vs-isolate)
 6. [Garbage Collection Behavior](#6-garbage-collection-behavior)
-7. [Core Components](#7-core-components)
-8. [Host-Facing Runtime API](#8-host-facing-runtime-api)
-9. [Script Lifecycle Model](#9-script-lifecycle-model)
-10. [Critical Implementation Details](#10-critical-implementation-details)
-11. [Project Structure](#11-project-structure)
-12. [Configuration System](#12-configuration-system)
-13. [Observability & Debugging](#13-observability--debugging)
-14. [Key Decisions & Rationale](#14-key-decisions--rationale)
+7. [Sandbox Limitations](#7-sandbox-limitations)
+8. [Core Components](#8-core-components)
+9. [Host-Facing Runtime API](#9-host-facing-runtime-api)
+10. [Script Lifecycle Model](#10-script-lifecycle-model)
+11. [Critical Implementation Details](#11-critical-implementation-details)
+12. [Project Structure](#12-project-structure)
+13. [Configuration System](#13-configuration-system)
+14. [Observability & Debugging](#14-observability--debugging)
+15. [Key Decisions & Rationale](#15-key-decisions--rationale)
 
 ---
 
@@ -75,8 +76,8 @@ This shows how external programs talk to QuarkJS — the embedding concern, sepa
        ┌───────┼────────┐
        │       │        │
        ▼       ▼        ▼
-  Module   Event Loop  APIs
-  Loader
+  Module   Event Loop  APIs         ← peer components, not pipeline stages
+  Loader   (scheduler)
        │
        ▼
   Host Bindings
@@ -112,22 +113,31 @@ The internal pipeline — how a JS script executes once it enters the runtime.
 ```
   User Scripts
        │
-  Module Loader         ← import resolution + caching
+  Module Loader         ← import resolution + caching (ESM only)
        │
   Runtime APIs          ← console, timers
        │
   Host Bindings         ← Rust ↔ JS bridge  [HIGH RISK]
-       │
-  Event Loop            ← promise resolution, async tasks
        │
   Engine Wrapper        ← QuickJS Rust interface
        │
   QuickJS Engine        ← C engine (stable, proven)
 ```
 
-**Host Bindings is marked HIGH RISK** because it is where the vast majority of memory safety and error-handling bugs will originate. This layer requires the most careful design.
+**The Event Loop is not a stage in this pipeline.** It is a scheduler component owned by the Runtime Manager that runs alongside the pipeline — polling async tasks, running pending promise jobs, and resolving completed futures. Scripts do not "flow through" the event loop. The event loop drives when scripts run.
 
-Layer dependency order matters: Runtime APIs depend on bindings, bindings depend on the engine, and the event loop interacts with engine promise jobs.
+```
+Runtime Manager
+  ├── Engine
+  ├── Module Loader
+  ├── Host Bindings
+  ├── Sandbox
+  └── Event Loop (scheduler)  ← peer component, not pipeline stage
+```
+
+> **Host Bindings is marked HIGH RISK** because it is where the vast majority of memory safety and error-handling bugs will originate. This layer requires the most careful design.
+
+Layer dependency order: Runtime APIs depend on bindings, bindings depend on the engine, and the event loop interacts with engine promise jobs by calling `run_pending_jobs()` internally on each tick.
 
 ---
 
@@ -223,7 +233,7 @@ Strongest isolation. Required for true multi-tenant sandboxing. Higher memory co
 
 **Start with Model A: one JSRuntime, one JSContext.**
 
-QuarkJS is an embedded scripting runtime, not a multi-tenant cloud runtime. The complexity explosion from adding multiple contexts too early — shared objects, async job queues, module cache invalidation — makes the runtime unmaintainable before it is functional. Promote to Model B when a real host application requires plugin isolation.
+QuarkJS is an embedded scripting runtime, not a multi-tenant cloud runtime. The complexity explosion from adding multiple contexts too early makes the runtime unmaintainable before it is functional. Promote to Model B when a real host application requires plugin isolation.
 
 ---
 
@@ -240,19 +250,45 @@ QuickJS uses **reference counting with cycle detection**, not a tracing GC.
 
 ---
 
-## 7. Core Components
+## 7. Sandbox Limitations
 
-### 7.1 Runtime Manager — `src/runtime/runtime.rs`
+> ⚠️ **QuarkJS is a cooperative sandbox — not a security boundary.**
 
-The central orchestrator. All other components are owned and driven by the Runtime Manager. This is the entry point for both the Rust API and (in Milestone 3) the C API. It is not a layer in the execution pipeline — it is the system that runs the pipeline.
+The sandbox prevents **accidental** crashes, runaway scripts, and resource exhaustion. It does not prevent **malicious** code.
+
+**What the sandbox enforces:**
+
+- Memory limit via `JS_SetMemoryLimit`
+- Execution timeout via interrupt handler
+- Restricted API surface — scripts can only call what the host explicitly registers
+- Module path jail — imports cannot escape the configured root
+
+**What the sandbox does not protect against:**
+
+- Malicious scripts crafted to exploit edge cases
+- Stack exhaustion via deep recursion (`JS_SetMaxStackSize` helps but is not perfect)
+- Memory fragmentation under adversarial allocation patterns
+- Side-channel attacks or speculative execution exploits
+
+**If you are embedding QuarkJS in a multi-tenant product where scripts come from untrusted users, add process-level isolation (e.g. separate OS processes or containers) around the runtime.** The sandbox alone is not sufficient for that threat model.
+
+For the intended use cases — plugin systems, automation engines, SaaS customization, IoT — where scripts come from developers or controlled users, the sandbox is appropriate and effective.
+
+---
+
+## 8. Core Components
+
+### 8.1 Runtime Manager — `src/runtime/runtime.rs`
+
+The central orchestrator. All other components are owned and driven by the Runtime Manager. This is the entry point for both the Rust API and (in Milestone 3) the C API. It is not a stage in the execution pipeline — it is the system that owns and runs all components including the event loop scheduler.
 
 Responsibilities:
 - Initialize and own the QuickJS `JSRuntime` and `JSContext`
 - Coordinate component startup and shutdown order
 - Expose the host-facing API (`register_function`, `eval_script`, `call_export`)
-- Drive the event loop tick internally
+- Drive the event loop tick internally on each execution cycle
 
-### 7.2 Engine Wrapper — `src/engine/quickjs_wrapper.rs`
+### 8.2 Engine Wrapper — `src/engine/quickjs_wrapper.rs`
 
 Wraps the QuickJS C engine and provides a safe Rust interface. **Use `rquickjs` — do not write raw FFI bindings from scratch.**
 
@@ -264,9 +300,9 @@ Responsibilities:
 - Enforce memory limits via `JS_SetMemoryLimit`
 - Stop runaway scripts via `JS_SetInterruptHandler`
 
-### 7.3 Module Loader — `src/modules/`
+### 8.3 Module Loader — `src/modules/`
 
-Handles JavaScript module resolution and loading. Module sources are resolved through a Resolver interface — never directly from the filesystem.
+Handles JavaScript module resolution and loading. Module sources are resolved through a Resolver interface — never directly from the filesystem. **ESM only** — CommonJS and native C modules are out of scope.
 
 Responsibilities:
 - Resolve import paths against a configurable root
@@ -298,7 +334,7 @@ if !resolved.starts_with(&root) {
 }
 ```
 
-### 7.4 Host Binding System — `src/bindings/`
+### 8.4 Host Binding System — `src/bindings/`
 
 The bridge between the Rust host application and the JavaScript runtime. **Highest-risk component in the project.**
 
@@ -330,9 +366,20 @@ runtime.register_function("getOrder", |args| {
 });
 ```
 
-### 7.5 Sandbox System — `src/sandbox/`
+**Handle ownership model:**
 
-Ensures scripts cannot crash or block the host. All limits are enforced at the engine level, not by convention.
+When passing Rust objects as opaque handles to JavaScript, ownership must be explicitly defined. JavaScript may hold a handle long after the Rust side expects to free the object — this is a use-after-free if not managed correctly.
+
+Two acceptable patterns:
+
+- **`Arc<T>`** — Rust and JS share ownership. The object lives until both sides release it. Use this when the host may also retain a reference to the same object.
+- **ID registry** — The runtime owns all objects in a `HashMap<u64, T>`. JS holds a numeric ID. When JS calls a method, the runtime looks up the object by ID. Deletion is explicit. Use this when you need full control over object lifetimes from the host side.
+
+Do not use raw pointers or `Box<T>` with transfer semantics unless you can prove the JS side cannot outlive the Rust allocation.
+
+### 8.5 Sandbox System — `src/sandbox/`
+
+Ensures scripts cannot accidentally crash or block the host. See [Section 7](#7-sandbox-limitations) for the full limitations of what this sandbox does and does not protect against.
 
 Enforced limits:
 - Memory limit (configurable, default 32 MB)
@@ -340,9 +387,9 @@ Enforced limits:
 - Module cache size (configurable, default 256 entries)
 - Restricted API surface — only explicitly registered functions are available
 
-### 7.6 Interrupt Handler — `src/sandbox/interrupt.rs`
+### 8.6 Interrupt Handler — `src/sandbox/interrupt.rs`
 
-The interrupt handler is how execution timeouts are enforced. QuickJS calls the registered handler periodically during script execution.
+The interrupt handler is how execution timeouts are enforced. QuickJS calls `JS_SetInterruptHandler()` periodically during script execution.
 
 ```rust
 JS_SetInterruptHandler(rt, |opaque| {
@@ -358,13 +405,19 @@ Must be registered before any script executes.
 
 **Performance note:** QuickJS calls the interrupt handler frequently — on every bytecode instruction boundary in some builds. The handler body must be as cheap as possible: a single elapsed time check. No allocations, no locks, no system calls inside the handler.
 
-### 7.7 Event Loop — `src/event_loop/` *(Milestone 2)*
+### 8.7 Event Loop — `src/event_loop/` *(Milestone 2)*
 
-QuickJS supports promises but ships without a native event loop. The runtime implements a minimal loop that polls async tasks, runs pending promise jobs, and resolves completed futures.
+The event loop is a **scheduler**, not a pipeline stage. It is owned by the Runtime Manager and runs alongside the other components. It drives when execution happens — it does not sit between other layers in the execution flow.
+
+Responsibilities:
+- Poll async tasks
+- Run pending promise jobs via `JS_ExecutePendingJob`
+- Resolve completed futures
+- Drive timer callbacks (`setTimeout`, `setInterval`)
 
 **Deadlock risk with Worker Thread Pattern:**
 
-If Option B (Worker Thread) is chosen for thread safety, the event loop **must** reside on the same worker thread as the runtime. If the host tries to synchronously await a script result from the main thread while the worker is blocked, the threads deadlock.
+If Option B (Worker Thread) is chosen for thread safety, the event loop **must** reside on the same worker thread as the runtime. If the host application tries to synchronously await a script result from the main thread while the worker is blocked, the threads deadlock.
 
 The fix: `QuarkRuntime` must either:
 1. Run `run_pending_jobs()` internally as part of its own tick — the host never calls it directly
@@ -377,7 +430,9 @@ let result: Future<JsValue> = runtime.call_export_async("handleOrder", args)?;
 
 Never expose a blocking `await_result()` that holds a lock across the channel boundary.
 
-### 7.8 Runtime APIs — `src/api/`
+> **Note on async host applications:** If the host uses Tokio or any async Rust runtime, Option A (`!Send + !Sync`) becomes painful because the QuarkJS runtime must live on a single-threaded executor. In that case, choose Option B from the start. Migrating from Option A to Option B after the fact is a significant refactor.
+
+### 8.8 Runtime APIs — `src/api/`
 
 Minimal built-in APIs implemented using host bindings:
 - `console.log`
@@ -386,7 +441,7 @@ Minimal built-in APIs implemented using host bindings:
 
 ---
 
-## 8. Host-Facing Runtime API
+## 9. Host-Facing Runtime API
 
 ```rust
 let runtime = QuarkRuntime::new(QuarkConfig {
@@ -399,34 +454,41 @@ let runtime = QuarkRuntime::new(QuarkConfig {
 runtime.register_function("log", log_fn)?;
 runtime.register_function("applyDiscount", discount_fn)?;
 
+// Load and execute a script
 runtime.eval_script("script.js")?;
+
+// Call a specific exported function
 runtime.call_export("onStart", &[])?;
+
+// Compile to bytecode for fast reloading (Milestone 2)
+let bytecode = runtime.compile_script("script.js")?;
+runtime.run_compiled(bytecode)?;
 ```
 
 Scripts are loaded once, exports are called repeatedly. The host controls the entire lifecycle.
 
 ---
 
-## 9. Script Lifecycle Model
+## 10. Script Lifecycle Model
 
 ```
 1. Runtime initialization     → QuarkRuntime::new(config)
 2. Host API registration      → register_function(...)
 3. Script loading             → eval_script("script.js")
 4. Export invocation          → call_export("onStart", args)  [repeated]
-5. Event loop processing      → handled internally per tick   [Milestone 2]
+5. Event loop tick            → driven internally by Runtime Manager  [Milestone 2]
 6. Runtime shutdown           → drop(runtime)
 ```
 
-Scripts are **loaded once** and their exports are **called repeatedly**. A script is not re-parsed on every invocation. `run_pending_jobs()` is not exposed as a public host API — it is called internally on each tick.
+Scripts are **loaded once** and their exports are **called repeatedly**. A script is not re-parsed on every invocation. `run_pending_jobs()` is not exposed as a public host API — it is called internally by the event loop scheduler on each tick.
 
 ---
 
-## 10. Critical Implementation Details
+## 11. Critical Implementation Details
 
-> These four issues will require a full rewrite of `src/engine/` and `src/bindings/` if not addressed before writing code.
+> These five issues will require a full rewrite of `src/engine/` and `src/bindings/` if not addressed before writing code.
 
-### 10.1 The Finalizer — Memory Safety for Host Objects
+### 11.1 The Finalizer — Memory Safety for Host Objects
 
 **Risk:** Without a finalizer, Rust objects exposed to JavaScript live forever on the heap. Missing a single `Drop` implementation means the host's RAM bleeds until the process is killed.
 
@@ -435,9 +497,9 @@ Rules:
 - `src/bindings/object.rs` must implement a **JS Class Finalizer** for every exposed type
 - `rquickjs` provides the `Class<T>` trait for this — study it before writing any bindings code
 
-### 10.2 The Sync Gatekeeper — Thread Safety
+### 11.2 The Sync Gatekeeper — Thread Safety
 
-**Risk:** QuickJS is strictly single-threaded. Calling the runtime from a different thread causes a segfault or memory corruption — intermittently, under load, and very painful to diagnose.
+**Risk:** QuickJS is strictly single-threaded. Calling the runtime from a different thread causes a segfault or memory corruption — intermittently, under load, and extremely painful to diagnose.
 
 **Option A — Compiler-enforced single-thread:**
 
@@ -448,9 +510,9 @@ pub struct QuarkRuntime {
 ```
 
 **Option B — Worker Thread Pattern:**
-`QuarkRuntime` lives permanently on a dedicated thread. The host communicates via `mpsc` channels. Required for multi-threaded host applications. If choosing this, re-read Section 7.7 on the event loop deadlock risk before implementing.
+`QuarkRuntime` lives permanently on a dedicated thread. The host communicates via `mpsc` channels. Required for multi-threaded host applications or any host using Tokio. If choosing this, re-read Section 8.7 on the event loop deadlock risk before implementing.
 
-### 10.3 Host-to-JS Error Mapping — Exception Strategy
+### 11.3 Host-to-JS Error Mapping — Exception Strategy
 
 **Risk:** If a Rust host function fails with no error strategy, scripts silently succeed with undefined behavior.
 
@@ -464,7 +526,7 @@ runtime.register_function("log", |args| {
 
 Use `anyhow::Error` or a project-specific error enum throughout. **Never use `unwrap()` in the bindings layer.**
 
-### 10.4 Panic Isolation — Preventing Host Crashes
+### 11.4 Panic Isolation — Preventing Host Crashes
 
 **Risk:** A Rust panic inside a host binding unwinds through QuickJS C code. Unwinding across FFI is undefined behavior. One panicking plugin takes down the entire host.
 
@@ -482,9 +544,20 @@ runtime.register_function("log", |args| {
 
 **Rule:** All host bindings must be panic-safe. No exceptions.
 
+### 11.5 Handle Ownership — Preventing Use-After-Free
+
+**Risk:** JavaScript may hold a handle to a Rust object long after the host expects to have freed it. Without an explicit ownership model this is a use-after-free.
+
+Two acceptable patterns:
+
+- **`Arc<T>`** — shared ownership between Rust and JS. Object lives until both sides release it.
+- **ID registry** — runtime owns all objects in a `HashMap<u64, T>`. JS holds a numeric ID. Deletion is explicit and controlled by the host.
+
+Decide which pattern to use before writing any bindings code. Do not mix patterns across the codebase.
+
 ---
 
-## 11. Project Structure
+## 12. Project Structure
 
 ```
 quarkjs/
@@ -536,7 +609,7 @@ quarkjs/
 
 ---
 
-## 12. Configuration System
+## 13. Configuration System
 
 ```rust
 QuarkConfig {
@@ -551,7 +624,7 @@ Configuration is passed at runtime initialization. Scripts have no mechanism to 
 
 ---
 
-## 13. Observability & Debugging
+## 14. Observability & Debugging
 
 Even at MVP, the following must be tracked:
 
@@ -564,7 +637,7 @@ These are the responsibility of the engine wrapper and binding system to emit. W
 
 ---
 
-## 14. Key Decisions & Rationale
+## 15. Key Decisions & Rationale
 
 **Use `rquickjs`, not raw FFI**
 rquickjs is actively maintained and has already solved reference counting and finalizer patterns in Rust. Raw FFI from scratch would triple the time to Milestone 1 and introduce preventable bugs.
@@ -573,19 +646,31 @@ rquickjs is actively maintained and has already solved reference counting and fi
 `quarkjs-core` (lib) and `quarkjs-cli` (binary) are separate crates in a workspace. This correctly separates the embeddable API surface from test scaffolding.
 
 **Model A context model for MVP**
-One `JSRuntime` with one `JSContext`. The complexity explosion from multiple contexts too early makes the runtime unmaintainable before it is functional. Promote to Model B when a real use case requires it.
+One `JSRuntime` with one `JSContext`. The complexity explosion from multiple contexts too early makes the runtime unmaintainable before it is functional.
+
+**ESM only**
+CommonJS and native C modules are out of scope. Leaving module format ambiguous invites complexity. ESM is the correct choice for a modern embedded runtime.
 
 **No filesystem / network APIs**
 The host application controls all I/O through registered bindings. Scripts can only access capabilities the host explicitly grants.
 
-**Event loop deferred to Milestone 2**
-A correct event loop requires working bindings and sandbox limits first. Building it second avoids designing the loop before understanding the constraints and deadlock risks.
+**Event loop is a scheduler, not a pipeline stage**
+The event loop drives when the pipeline runs — it does not sit inside it. Modeling it as a pipeline stage creates a misleading mental model that leads to incorrect deadlock analysis and lifecycle bugs.
+
+**Cooperative sandbox, not a security boundary**
+QuarkJS prevents accidental runaway execution, not malicious code. Documented explicitly so embedders do not rely on it for multi-tenant isolation without additional process-level hardening.
+
+**Handle ownership via `Arc<T>` or ID registry**
+Raw pointer or `Box<T>` transfer semantics between Rust and JS create use-after-free conditions when JS holds a handle longer than expected. Ownership must be explicit before writing any bindings code.
+
+**Bytecode caching planned from Milestone 2**
+QuickJS supports `JS_WriteObject` / `JS_ReadObject` for compile-once, run-many semantics. Without this, every restart re-parses every script. The `compile_script` / `run_compiled` API is planned for Milestone 2.
 
 **Panic isolation is mandatory from day one**
-Panics crossing FFI into QuickJS C code are undefined behavior. This must be addressed in the first binding written, not added later.
-
-**Handles over serialization**
-Passing opaque Rust handles via `Class<T>` instead of serializing full data structures into the JS heap prevents memory limit violations and spurious interrupt handler triggers on large payloads.
+Panics crossing FFI into QuickJS C code are undefined behavior. Must be addressed in the first binding written.
 
 **C API designed for from day one**
-The three-layer model must be respected in the architecture from the start. A Rust-only design that retrofits C ABI later requires a full public API redesign.
+The three-layer model must be respected from the start. A Rust-only design that retrofits C ABI later requires a full public API redesign.
+
+**Worker thread if using async host**
+If the host application uses Tokio or any async runtime, choose Option B (Worker Thread) from the start. Migrating from Option A after the fact is a significant refactor.
