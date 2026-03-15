@@ -16,7 +16,7 @@ The architecture is finalized. The repository structure is in place. Active deve
 
 **Goal:** Validate the core architecture and prove the safety boundaries hold.
 
-A runtime that passes the five criterion tests below is architecturally correct. One that doesn't has a hole somewhere, regardless of how much else works.
+A runtime that passes all five criterion tests below is architecturally correct. One that doesn't has a hole somewhere, regardless of how much else works.
 
 ### Deliverables
 
@@ -27,11 +27,12 @@ A runtime that passes the five criterion tests below is architecturally correct.
 - [ ] `eval_script()` script execution
 - [ ] `call_export()` export invocation
 - [ ] `console.log` implementation
-- [ ] Basic module imports
-- [ ] Root-jailed module resolver
+- [ ] Basic ESM module imports
+- [ ] Root-jailed module resolver with `canonicalize()` verification
 - [ ] Panic isolation via `catch_unwind` on all bindings
 - [ ] `Result`-based error mapping to JS exceptions
-- [ ] Interrupt handler (execution timeout)
+- [ ] Execution timeout via interrupt handler
+- [ ] Handle ownership model decided and implemented (`Arc<T>` or ID registry)
 
 ### Success Criterion — all five must pass
 
@@ -70,6 +71,8 @@ while (true) {}
 // Expected: terminated after execution_timeout, host process survives
 ```
 
+If all five pass, your sandbox is real. If any fail, your architecture has a hole.
+
 ---
 
 ## Milestone 2 — Sandbox + Async
@@ -79,20 +82,22 @@ while (true) {}
 ### Deliverables
 
 - [ ] Memory limits enforced via `JS_SetMemoryLimit`
-- [ ] Execution timeout + interrupt handler (hardened)
-- [ ] Event loop — minimal promise job runner
+- [ ] Execution timeout hardened
+- [ ] Event loop — minimal promise job scheduler (peer component under Runtime Manager, not pipeline stage)
 - [ ] `setTimeout` implementation
 - [ ] `setInterval` implementation
 - [ ] Module caching with LRU eviction
-- [ ] Worker Thread pattern (Option B) with Future-based host API, if needed
-- [ ] Deadlock prevention — `run_pending_jobs()` internal to runtime tick
+- [ ] Bytecode compilation and caching (`compile_script` / `run_compiled` via `JS_WriteObject` / `JS_ReadObject`)
+- [ ] Worker Thread pattern with Future-based host API (required if host uses Tokio or async Rust)
+- [ ] Deadlock prevention — `run_pending_jobs()` internal to runtime tick, never exposed publicly
 
 ### Success Criterion
 
 - A script using `setTimeout` resolves correctly without blocking the host
-- A script allocating beyond `memory_limit` is terminated cleanly with a catchable error
+- A script allocating beyond `memory_limit` is terminated cleanly with a catchable JS error
 - Module imports are served from cache on second load
 - The host can call `call_export_async()` and await a `Future` without deadlocking
+- A compiled bytecode file loads and executes faster than parsing the source equivalent
 
 ---
 
@@ -113,15 +118,15 @@ while (true) {}
 
 ### Success Criterion
 
-- A C program can embed QuarkJS using only the C API with no Rust toolchain
-- A plugin system with multiple isolated script contexts runs without global scope leakage
+- A C program can embed QuarkJS using only the C API with no Rust toolchain installed
+- A plugin system with multiple isolated script contexts runs without global scope leakage between plugins
 - `cargo doc` produces complete, accurate API documentation
 
 ---
 
 ## Future / Unscheduled
 
-These are not on the active roadmap. They are recorded here so they are not forgotten and not accidentally added to an earlier milestone.
+These are not on the active roadmap. Recorded here so they are not forgotten and not accidentally pulled into an earlier milestone.
 
 | Item | Reason deferred |
 |---|---|
@@ -130,16 +135,20 @@ These are not on the active roadmap. They are recorded here so they are not forg
 | Script hot-reloading | Requires context lifecycle work from Milestone 3 first |
 | Metrics / tracing integration | Nice to have after the core is stable |
 | npm-compatible module resolution | Explicitly a non-goal; reconsider only with compelling use case |
+| CommonJS module support | ESM only is the correct scope for an embedded runtime |
 
 ---
 
 ## Design Constraints That Will Not Change
 
-These decisions are final. They are not open for milestone-by-milestone reconsideration.
+These decisions are final. They are not open for reconsideration at any milestone.
 
 - **No Node.js compatibility** — not a goal at any milestone
 - **No direct filesystem access from scripts** — host controls all I/O via bindings
 - **No direct networking from scripts** — same reason
 - **No JIT** — QuickJS does not provide one; adding a different engine is a different project
+- **ESM only** — CommonJS and native C modules are out of scope
 - **Panic isolation is mandatory** — `catch_unwind` on every binding, always, from Milestone 1 onward
 - **Handles over serialization** — large data structures must be passed as opaque handles, not cloned into the JS heap
+- **Cooperative sandbox only** — QuarkJS does not provide security-boundary isolation; process-level sandboxing is the embedder's responsibility for untrusted code
+- **Event loop is a scheduler** — it is never a pipeline stage; this architectural distinction is permanent
