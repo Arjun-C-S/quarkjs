@@ -137,7 +137,7 @@ Runtime Manager
 
 > **Host Bindings is marked HIGH RISK** because it is where the vast majority of memory safety and error-handling bugs will originate. This layer requires the most careful design.
 
-Layer dependency order: Runtime APIs depend on bindings, bindings depend on the engine, and the event loop interacts with engine promise jobs by calling `run_pending_jobs()` internally on each tick.
+Layer dependency order matters — read the stack bottom-up: the Engine is the foundation, Bindings sit on top of the Engine and use it to execute host functions, and Runtime APIs sit on top of Bindings and are implemented using them. `console.log` is a Runtime API implemented as a binding that calls a Rust function — it depends on the binding layer to work. The event loop interacts with engine promise jobs by calling `run_pending_jobs()` internally on each tick.
 
 ---
 
@@ -377,6 +377,16 @@ Two acceptable patterns:
 
 Do not use raw pointers or `Box<T>` with transfer semantics unless you can prove the JS side cannot outlive the Rust allocation.
 
+**Forward compatibility — per-context capability sets:** The current design registers functions globally via `runtime.register_function(...)`. This is correct for Model A (one context). When Milestone 3 adds Model B (multiple contexts), the binding system must support per-context registration so different plugins can be granted different API surfaces:
+
+```rust
+// Future API shape — not implemented until Model B
+runtime.register_function_for("pluginA", "metrics", metrics_fn)?;
+runtime.register_function_for("pluginB", "log", log_fn)?;
+```
+
+The current global registration design does not prevent this — per-context registration is a natural extension. No implementation change is needed now, but do not bake assumptions of a single global function table into the binding internals.
+
 ### 8.5 Sandbox System — `src/sandbox/`
 
 Ensures scripts cannot accidentally crash or block the host. See [Section 7](#7-sandbox-limitations) for the full limitations of what this sandbox does and does not protect against.
@@ -392,9 +402,14 @@ Enforced limits:
 The interrupt handler is how execution timeouts are enforced. QuickJS calls `JS_SetInterruptHandler()` periodically during script execution.
 
 ```rust
+// Store an absolute deadline, not a start_time + timeout calculation.
+// deadline is set to Instant::now() + timeout at the start of each
+// top-level execution tick and reset when the tick completes.
+// This prevents async callbacks from inheriting a stale time budget
+// from a previous tick — a subtle bug that only appears with promises.
 JS_SetInterruptHandler(rt, |opaque| {
     let state = opaque as *mut RuntimeState;
-    if (*state).start_time.elapsed() > (*state).timeout {
+    if Instant::now() > (*state).deadline {
         return 1;  // non-zero = interrupt execution
     }
     0
@@ -404,6 +419,8 @@ JS_SetInterruptHandler(rt, |opaque| {
 Must be registered before any script executes.
 
 **Performance note:** QuickJS calls the interrupt handler frequently — on every bytecode instruction boundary in some builds. The handler body must be as cheap as possible: a single elapsed time check. No allocations, no locks, no system calls inside the handler.
+
+**Async timeout correctness:** Using `start_time.elapsed() > timeout` is correct for synchronous single-call execution (Milestone 1) but breaks with async code. When a promise callback resumes after the event loop, it inherits the original `start_time` rather than getting a fresh budget. The correct model — required before Milestone 2 — is to store an absolute `deadline: Instant` in the runtime state, set it to `Instant::now() + timeout` at the start of each top-level tick, and reset it when the tick completes. The interrupt handler then checks `Instant::now() > deadline`.
 
 ### 8.7 Event Loop — `src/event_loop/` *(Milestone 2)*
 
@@ -464,6 +481,8 @@ runtime.call_export("onStart", &[])?;
 let bytecode = runtime.compile_script("script.js")?;
 runtime.run_compiled(bytecode)?;
 ```
+
+**Bytecode version pinning:** QuickJS bytecode is not portable across QuickJS versions. Bytecode compiled against one version will crash or produce undefined behavior when loaded by a different version. Every compiled bytecode blob must include a magic header containing a version hash, verified before execution. If the hash does not match the current runtime version, the bytecode must be rejected and recompiled from source. This prevents users from caching bytecode to disk and silently breaking their runtime after a QuarkJS dependency update.
 
 Scripts are loaded once, exports are called repeatedly. The host controls the entire lifecycle.
 
