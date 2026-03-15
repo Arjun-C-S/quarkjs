@@ -10,6 +10,8 @@
 
 It fills a specific gap: deterministic, safe scripting for applications that need user-programmable behavior — without the complexity of Node.js or Deno. If your application needs to run user-supplied scripts safely, expose a plugin API, or allow custom business logic, QuarkJS is designed for that.
 
+> **Current status: Pre-Alpha. No code exists yet.** The repository contains the architecture specification, roadmap, and project structure. Active development begins at Milestone 1.
+
 ---
 
 ## What it looks like
@@ -62,6 +64,8 @@ export function onStart() {
 | **Easy Embedding** | Host applications expose functions and run scripts with minimal integration effort |
 | **Deterministic** | Scripts cannot block or crash the host application |
 
+---
+
 ## Non-goals
 
 QuarkJS explicitly will not provide:
@@ -76,13 +80,11 @@ Each of these would roughly double the project's complexity and introduce signif
 
 ---
 
-## Current status
+## Sandbox disclaimer
 
-**QuarkJS is pre-alpha. No code exists yet.**
+> ⚠️ **QuarkJS is a cooperative sandbox — not a security boundary.**
 
-The repository currently contains the architecture specification, roadmap, and project structure. Active development begins at Milestone 1.
-
-See [ROADMAP.md](ROADMAP.md) for the build plan and [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical specification.
+The sandbox prevents accidental crashes and runaway execution. It does not protect against malicious scripts. For multi-tenant products where scripts come from untrusted users, wrap the runtime in process-level isolation. For the intended use cases — plugin systems, automation engines, SaaS customization, IoT — the sandbox is appropriate and effective.
 
 ---
 
@@ -108,7 +110,10 @@ QuarkJS is three stacked systems:
 └─────────────────────────────────────┘
 ```
 
+The event loop is a **scheduler** owned by the Runtime Manager — not a pipeline stage scripts flow through. This distinction matters for correct deadlock analysis and lifecycle design.
+
 For the full technical breakdown see [ARCHITECTURE.md](ARCHITECTURE.md).
+For the build plan see [ROADMAP.md](ROADMAP.md).
 
 ---
 
