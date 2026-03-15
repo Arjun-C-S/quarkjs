@@ -88,6 +88,8 @@ If all five pass, your sandbox is real. If any fail, your architecture has a hol
 - [ ] `setInterval` implementation
 - [ ] Module caching with LRU eviction
 - [ ] Bytecode compilation and caching (`compile_script` / `run_compiled` via `JS_WriteObject` / `JS_ReadObject`)
+- [ ] Bytecode version pinning — magic header with runtime version hash, verified on load before execution
+- [ ] Deadline-based timeout — replace `start_time` model with `deadline = Instant::now() + timeout`, reset per event loop tick
 - [ ] Worker Thread pattern with Future-based host API (required if host uses Tokio or async Rust)
 - [ ] Deadlock prevention — `run_pending_jobs()` internal to runtime tick, never exposed publicly
 
@@ -136,6 +138,8 @@ These are not on the active roadmap. Recorded here so they are not forgotten and
 | Metrics / tracing integration | Nice to have after the core is stable |
 | npm-compatible module resolution | Explicitly a non-goal; reconsider only with compelling use case |
 | CommonJS module support | ESM only is the correct scope for an embedded runtime |
+| Script identity (`load_script("id", source)`) | Needed for reload, unload, and per-script metrics — relevant when Model B lands in Milestone 3 |
+| Per-context capability sets | Plugins with different API access levels — design does not prevent it, implementation deferred to Model B |
 
 ---
 
