@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/quarkjs-core",
+    "crates/quarkjs-cli",
+]
+resolver = "2"
