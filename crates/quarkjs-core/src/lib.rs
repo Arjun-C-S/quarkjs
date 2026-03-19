@@ -1,14 +1,20 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+use crate::api::console;
+use rquickjs::{Context, Error, Runtime};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod api;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+pub fn run_quark(js_code: &str) {
+    let runtime = Runtime::new().expect("Failed to create JSRuntime");
+    let context = Context::full(&runtime).expect("Failed to create JSContext");
+
+    let response = console::init_console(&context);
+
+    if let Err(e) = response {
+        eprintln!("Failed to initialize console: {}", e);
+        return;
     }
+
+    context.with(|ctx| {
+        let _: Result<(), Error> = ctx.eval(js_code);
+    });
 }
