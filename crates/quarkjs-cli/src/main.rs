@@ -1,18 +1,17 @@
+use quarkjs_core::Engine;
+
 fn main() {
-    println!("QuarkJS CLI");
+    let engine = Engine::new().unwrap();
 
-    let js_code = format!(
-        "{}{}{}{}{}{}{}",
-        "console.log('Hello from the CLI string');",
-        "console.log(null);",
-        "console.log(42);",
-        "console.log(true);",
-        "console.log({});",
-        "console.log([]);",
-        "console.log(undefined);"
-    );
+    let result = engine.eval("1 * 2").unwrap();
 
-    quarkjs_core::run_quark(&js_code);
+    let result2 = engine.eval("console.log('Hello from console')").unwrap();
 
-    println!("QuarkJS CLI finished");
+    let result3 = engine.eval("console.log({ a: 1, b: { c: 0 } })").unwrap();
+
+    println!("{}", result);
+
+    println!("{}", result2);
+
+    println!("{}", result3);
 }

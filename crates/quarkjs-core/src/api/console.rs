@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use rquickjs::{Context, Ctx, Function, Object, Result, Value, function::Rest};
 
+use crate::utils::inspect::inspect_value;
+
 /// Log levels supported by the console.
 #[derive(Clone, Copy)]
 pub enum LogLevel {
@@ -49,48 +51,16 @@ impl ConsoleSink for StdoutSink {
     }
 }
 
-/// Simplified JavaScript value formatting.
-///
-/// This is NOT spec-compliant:
-/// - Does not invoke JS `ToString`
-/// - Does not inspect objects/arrays
-/// - Does not handle symbols, BigInt, etc.
-///
-/// It is intentionally minimal and predictable.
-fn format_js_value(value: &Value) -> String {
-    if value.is_undefined() {
-        return "undefined".into();
-    }
-
-    if value.is_null() {
-        return "null".into();
-    }
-
-    if let Some(s) = value.as_string() {
-        return s.to_string().unwrap_or_else(|_| "[string error]".into());
-    }
-
-    if let Some(b) = value.as_bool() {
-        return b.to_string();
-    }
-
-    if let Some(n) = value.as_number() {
-        return n.to_string();
-    }
-
-    // Fallback: align loosely with JS "[object Type]"
-    format!("[object {}]", value.type_of())
-}
-
 /// Core logging function with reduced allocations.
-fn build_log_line(args: &[Value]) -> String {
+fn build_log_line(ctx: &Ctx, args: &[Value]) -> String {
     let mut line = String::new();
 
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
             line.push(' ');
         }
-        line.push_str(&format_js_value(arg));
+        let formatted = inspect_value(&ctx, arg, 0);
+        line.push_str(&formatted);
     }
 
     line
@@ -102,8 +72,8 @@ fn make_logger<'js>(
     level: LogLevel,
     sink: Arc<dyn ConsoleSink>,
 ) -> Result<Function<'js>> {
-    Function::new(ctx, move |args: Rest<Value>| -> Result<()> {
-        let line = build_log_line(&args.0);
+    Function::new(ctx.clone(), move |args: Rest<Value>| -> Result<()> {
+        let line = build_log_line(&ctx, &args.0);
         sink.log(level, &line);
         Ok(())
     })
