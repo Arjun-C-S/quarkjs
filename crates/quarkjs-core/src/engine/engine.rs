@@ -28,10 +28,6 @@ impl Engine {
     }
 
     /// Evaluate JavaScript code and return the result.
-    ///
-    /// NOTE:
-    /// - Currently returns a debug string
-    /// - This is temporary (will change later)
     pub fn eval(&self, code: &str) -> Result<JsValue> {
         self.context.with(|ctx| {
             let value: Value = ctx.eval(code)?;

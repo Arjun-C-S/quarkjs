@@ -1,14 +1,33 @@
-use rquickjs::{Ctx, Object, Value};
+use rquickjs::{Object, Value};
 
-const MAX_DEPTH: usize = 3;
+/// For controlling inspection behavior.
+#[derive(Clone)]
+pub struct InspectOptions {
+    pub max_depth: usize,
+}
 
-pub fn inspect_value(ctx: &Ctx, value: &Value, depth: usize) -> String {
-    if depth > MAX_DEPTH {
+impl Default for InspectOptions {
+    fn default() -> Self {
+        Self { max_depth: 2 }
+    }
+}
+
+// Use a Vec as an ancestor stack instead of a global HashSet.
+// This is drastically faster for shallow depths and fixes the sibling bug.
+type Seen<'js> = Vec<Object<'js>>;
+
+pub fn inspect_value<'js>(
+    value: &Value<'js>,
+    depth: usize,
+    seen: &mut Seen<'js>,
+    opts: &InspectOptions,
+) -> String {
+    if depth >= opts.max_depth {
         return "...".into();
     }
 
-    if value.is_object() {
-        return inspect_object(ctx, value, depth);
+    if let Some(obj) = value.as_object() {
+        return inspect_object(obj, depth, seen, opts);
     }
 
     if let Some(s) = value.as_string() {
@@ -34,28 +53,31 @@ pub fn inspect_value(ctx: &Ctx, value: &Value, depth: usize) -> String {
     "[unknown]".into()
 }
 
-fn inspect_object(ctx: &Ctx, value: &Value, depth: usize) -> String {
-    let obj = match Object::from_value(value.clone()) {
-        Ok(o) => o,
-        Err(_) => return "[object Object]".into(),
-    };
+fn inspect_object<'js>(
+    obj: &Object<'js>,
+    depth: usize,
+    seen: &mut Seen<'js>,
+    opts: &InspectOptions,
+) -> String {
+    if seen.contains(obj) {
+        return "[Circular]".into();
+    }
+
+    seen.push(obj.clone());
 
     let mut parts = Vec::new();
 
-    for k in obj.keys() {
-        let key: String = match k {
-            Ok(k) => k,
-            Err(_) => continue,
-        };
+    for prop in obj.props::<String, Value<'js>>() {
+        if let Ok((key, val)) = prop {
+            let formatted = inspect_value(&val, depth + 1, seen, opts);
+            parts.push(format!("{}: {}", key, formatted));
+        }
+    }
 
-        let val: Value = match obj.get(&key) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    seen.pop();
 
-        let formatted = inspect_value(ctx, &val, depth + 1);
-
-        parts.push(format!("{}: {}", key, formatted));
+    if parts.is_empty() {
+        return "{}".into();
     }
 
     format!("{{ {} }}", parts.join(", "))

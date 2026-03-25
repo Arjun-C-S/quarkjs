@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rquickjs::{Context, Ctx, Function, Object, Result, Value, function::Rest};
 
-use crate::utils::inspect::inspect_value;
+use crate::utils::inspect::{InspectOptions, inspect_value};
 
 /// Log levels supported by the console.
 #[derive(Clone, Copy)]
@@ -52,14 +52,22 @@ impl ConsoleSink for StdoutSink {
 }
 
 /// Core logging function with reduced allocations.
-fn build_log_line(ctx: &Ctx, args: &[Value]) -> String {
+fn build_log_line<'js>(args: &[Value<'js>]) -> String {
     let mut line = String::new();
+
+    let opts = InspectOptions::default();
 
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
             line.push(' ');
         }
-        let formatted = inspect_value(&ctx, arg, 0);
+
+        // CRITICAL: The cycle detection stack MUST be scoped to the individual argument.
+        // Reusing a single `seen` Vec across different arguments will cause false circular triggers.
+        let mut seen = Vec::new();
+
+        // Pass the required mutable references
+        let formatted = inspect_value(arg, 0, &mut seen, &opts);
         line.push_str(&formatted);
     }
 
@@ -72,8 +80,8 @@ fn make_logger<'js>(
     level: LogLevel,
     sink: Arc<dyn ConsoleSink>,
 ) -> Result<Function<'js>> {
-    Function::new(ctx.clone(), move |args: Rest<Value>| -> Result<()> {
-        let line = build_log_line(&ctx, &args.0);
+    Function::new(ctx.clone(), move |args: Rest<Value<'js>>| -> Result<()> {
+        let line = build_log_line(&args.0);
         sink.log(level, &line);
         Ok(())
     })
